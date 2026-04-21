@@ -20,5 +20,9 @@ This repository is currently a lightweight wrapper/entry repo intended to track 
   - upstream `vllm-ascend`
 - In the current clone state, submodule directories exist but are not populated with source content.
 
-## Practical implication
-To inspect actual implementation code architecture, module boundaries, and runtime stack, the submodules need to be initialized and checked out.
+## Submodule details
+
+Detailed analysis of each submodule's internal structure, key technologies, and module breakdown is available in separate files in this directory:
+
+- [`vllm-submodule.md`](vllm-submodule.md) — covers the core vLLM engine, entrypoints, model executor, distributed runtime, C++/CUDA kernel layer, and dependencies.
+- [`vllm-ascend-submodule.md`](vllm-ascend-submodule.md) — covers the Ascend NPU hardware plugin: platform registration, attention/operator/worker implementations, CANN kernel layer, and how it integrates back into vLLM.
