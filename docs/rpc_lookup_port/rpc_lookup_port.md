@@ -190,7 +190,7 @@ LookupKeyClient.lookup() ← zmq.REQ.recv() returns num_hit_tokens
 
 ---
 
-## 5) Practical usage guidance
+## 6) Practical usage guidance
 
 For KV Pool / AscendStoreConnector configs, set:
 
@@ -216,7 +216,165 @@ Notes:
 
 ---
 
-## 6) Source map used for this summary
+## 7) What happens when two instances share the same `lookup_rpc_port`?
+
+### ZMQ IPC is backed by a Unix domain socket file
+
+When ZMQ binds an `ipc://` address it creates a socket file on the filesystem, e.g.:
+
+```
+/tmp/vllm/lookup_rpc_port_1_dp_rank0   ← socket inode
+```
+
+Both sides independently call `get_zmq_rpc_path_lookup(vllm_config)` to derive this path. If two
+vLLM instances produce the same path string, they will compete for the same socket file.
+
+### Two failure modes
+
+#### Mode A — Second `REP` bind fails hard (if socket file already exists)
+
+When instance B's `LookupKeyServer` tries to call `socket.bind(path)` while instance A is still
+running and holds the file open:
+
+```
+zmq.error.ZMQError: Address already in use
+  File "pool_scheduler.py", line ...
+    make_zmq_socket(zmq.REP, path, bind=True)
+```
+
+Instance B crashes at startup before serving any request. This is the *safe* failure: noisy but
+self-limiting.
+
+#### Mode B — Second `REQ` connects to the wrong `REP` (silent data corruption)
+
+If the socket file is present but instance A's `REP` socket is **no longer listening** (e.g., A
+crashed without cleaning up the file), instance B's `LookupKeyClient` (`zmq.REQ`) still connects
+successfully to that stale path. Two sub-cases:
+
+```
+# Sub-case B1 — nobody listening
+Scheduler B calls LookupKeyClient.lookup(token_len, block_hashes)
+  └─ REQ.send_multipart(frames)
+       └─ REQ.recv() blocks forever    ← scheduler hangs; all requests stall
+```
+
+```
+# Sub-case B2 — instance A partially alive
+Instance B scheduler  ──REQ.send──►  Instance A LookupKeyServer
+                      ◄──REP.recv──  returns hit count from A's m_store (wrong data)
+```
+
+In sub-case B2, instance B's scheduling decisions are based on **instance A's KV cache state**:
+
+- B may skip prefill for tokens that are **not** in B's own KV store (falsely treated as cached).
+- B may issue redundant prefill for tokens that **are** in B's KV store but unknown to A.
+- No exception is raised; the model output remains syntactically correct, making this bug hard to detect.
+
+### Summary table
+
+| Scenario | What ZMQ does | Symptom |
+|----------|--------------|---------|
+| Both instances running, same port | Second bind raises `EADDRINUSE` | Instance B crashes at startup |
+| Instance A dead, stale socket file, nobody listening | B's REQ connects, then blocks on recv | Scheduler B hangs indefinitely |
+| Instance A dead, stale socket file, A briefly restarts | B's REQ talks to A's REP | Silent cross-instance KV lookup corruption |
+
+### Mitigation on bare metal / same host
+
+Set a different `lookup_rpc_port` per instance **or** set `VLLM_RPC_BASE_PATH` to a per-instance
+directory:
+
+```bash
+# Instance A
+VLLM_RPC_BASE_PATH=/tmp/vllm_A \
+  vllm serve ... --kv-connector-extra-config '{"lookup_rpc_port": "1"}'
+
+# Instance B — different base path; same port value is now safe
+VLLM_RPC_BASE_PATH=/tmp/vllm_B \
+  vllm serve ... --kv-connector-extra-config '{"lookup_rpc_port": "1"}'
+```
+
+---
+
+## 8) Docker: are two containers with the same `lookup_rpc_port` isolated?
+
+### Short answer: **Yes, by default** — but with important caveats.
+
+### Why they are isolated by default
+
+Docker (via Linux namespaces) gives each container its own **mount namespace**. The container's
+filesystem tree — including `/tmp` — is completely independent of the host's `/tmp` and of other
+containers' `/tmp`:
+
+```
+Host filesystem:   /tmp/vllm/...     (separate inode namespace)
+Container A:       /tmp/vllm/...     (overlay on container A's rootfs layer)
+Container B:       /tmp/vllm/...     (overlay on container B's rootfs layer)
+```
+
+A Unix domain socket is just a file. Because the two containers' filesystems are **separate**,
+there is **no sharing** of the socket inode:
+
+- Container A: `bind("ipc:///tmp/vllm/lookup_rpc_port_1_dp_rank0")` → socket in A's `/tmp`
+- Container B: `bind("ipc:///tmp/vllm/lookup_rpc_port_1_dp_rank0")` → socket in B's `/tmp`
+
+These are different filesystem objects. Neither bind fails, and neither client can cross-connect.
+
+### When Docker does **NOT** isolate you (caveats)
+
+#### Caveat 1 — Shared host volume for `/tmp`
+
+```bash
+docker run -v /tmp:/tmp vllm-instance-A ...
+docker run -v /tmp:/tmp vllm-instance-B ...
+```
+
+Both containers see the same `/tmp` on the host. The socket file collision is identical to the
+bare-metal case. **Fix**: use per-instance volumes or set `VLLM_RPC_BASE_PATH` to a unique path.
+
+#### Caveat 2 — `--network=host` is **irrelevant** for IPC sockets
+
+`--network=host` shares the network namespace (TCP/UDP ports), **not** the mount namespace. IPC
+(`ipc://`) sockets are filesystem-based and remain isolated regardless of `--network` mode.
+
+#### Caveat 3 — `--ipc=host` is also **irrelevant**
+
+Docker's `--ipc` flag controls the **System V IPC namespace** (shared memory, semaphores, message
+queues). ZMQ IPC sockets are plain Unix domain socket files — not System V IPC — so `--ipc=host`
+does not expose any collision risk.
+
+#### Caveat 4 — Kubernetes shared `emptyDir` on `/tmp`
+
+If two pods on the same node mount the same `emptyDir` or host-path volume at `/tmp`, the
+isolation collapses to the bare-metal case. Use unique `lookup_rpc_port` values or unique
+`VLLM_RPC_BASE_PATH` paths in that configuration.
+
+### Decision matrix
+
+| Docker / K8s configuration | Isolated? | Risk |
+|---------------------------|-----------|------|
+| Default (no special flags) | ✅ Yes | None |
+| `-v /tmp:/tmp` (shared host `/tmp`) | ❌ No | Same as bare-metal collision |
+| `--tmpfs /tmp` (per-container tmpfs) | ✅ Yes | None |
+| `--network=host` | ✅ Yes | No effect on IPC sockets |
+| `--ipc=host` | ✅ Yes | System V IPC only; ZMQ unaffected |
+| `--ipc=container:<A>` | ✅ Yes | Same reason |
+| Kubernetes shared `emptyDir` on `/tmp` | ❌ No | Treat as shared volume |
+
+### How to be safe across all environments
+
+| Environment | Safe configuration |
+|-------------|-------------------|
+| Bare metal / VM | Different `lookup_rpc_port` **or** different `VLLM_RPC_BASE_PATH` per instance |
+| Docker (default) | No action needed; filesystem is already isolated |
+| Docker with `-v /tmp:/tmp` | Different `lookup_rpc_port` **or** different `VLLM_RPC_BASE_PATH` |
+| Kubernetes (shared host-path `/tmp`) | Different `lookup_rpc_port` per instance |
+
+**Universal rule:** always set `lookup_rpc_port` to a value unique per vLLM instance, regardless
+of deployment topology. The cost is a single config key; the benefit is guaranteed safety.
+
+---
+
+## 9) Source map used for this summary
 
 - Local submodule code/docs:
   - `vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py`
