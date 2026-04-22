@@ -57,7 +57,121 @@ This gives backward compatibility while migrating old configs.
 
 ---
 
-## 4) Why this key exists (history from upstream issues/PRs)
+## 4) Function call chain
+
+This section traces how `lookup_rpc_port` is actually exercised at runtime, on both the **startup** (port resolution) path and the **per-request** (lookup query) path.
+
+### 4.1 Startup path — port resolution
+
+Both the server and the client call the same helper to derive the IPC socket address. The config key is read **once** during connector initialization, long before any request arrives.
+
+```
+# ---- WORKER PROCESS (rank 0) ----
+
+vllm serve ...
+  └─ EngineCore.__init__()  [vllm/vllm/v1/engine/core.py]
+       └─ KVConnectorBase_V1 subclass instantiated with role=WORKER
+            └─ AscendStoreConnector.__init__(vllm_config, role=WORKER)
+                 │   [vllm-ascend/…/ascend_store_connector.py]
+                 ├─ KVPoolWorker.__init__(vllm_config, use_layerwise)
+                 │    [vllm-ascend/…/pool_worker.py]
+                 └─ LookupKeyServer.__init__(pool_worker, vllm_config, use_layerwise)
+                      │  [vllm-ascend/…/ascend_store_connector.py]
+                      └─ get_zmq_rpc_path_lookup(vllm_config)
+                           │  [vllm-ascend/…/pool_scheduler.py]
+                           ├─ reads kv_transfer_config.kv_connector_extra_config
+                           │   → "lookup_rpc_port" (preferred)
+                           │   → "mooncake_rpc_port" (deprecated fallback + warning)
+                           │   → default 0
+                           └─ returns "ipc://<VLLM_RPC_BASE_PATH>/lookup_rpc_port_<N>_dp_rank<R>"
+                                └─ zmq.REP socket bound at that path
+                                     └─ background thread starts (process_request loop)
+
+# ---- SCHEDULER PROCESS ----
+
+vllm serve ...
+  └─ Scheduler.__init__()  [vllm/vllm/v1/core/sched/scheduler.py]
+       └─ KVConnectorBase_V1 subclass instantiated with role=SCHEDULER
+            └─ AscendStoreConnector.__init__(vllm_config, role=SCHEDULER)
+                 │   [vllm-ascend/…/ascend_store_connector.py]
+                 └─ KVPoolScheduler.__init__(vllm_config, use_layerwise)
+                      │  [vllm-ascend/…/pool_scheduler.py]
+                      └─ LookupKeyClient.__init__(vllm_config)
+                           └─ get_zmq_rpc_path_lookup(vllm_config)
+                                └─ (same derivation as above → must match server)
+                                     └─ zmq.REQ socket connected to that path
+```
+
+> **Key invariant:** Both sides call `get_zmq_rpc_path_lookup(vllm_config)` with the same `vllm_config`. The resulting IPC path must be identical. If two vLLM instances run on the same host, they must use different `lookup_rpc_port` values to avoid socket collisions.
+
+---
+
+### 4.2 Per-request path — lookup query
+
+When a new request arrives and the scheduler needs to decide how many tokens can be loaded from the KV Pool, it triggers the ZMQ RPC round-trip built on the port resolved above.
+
+```
+# ---- SCHEDULER PROCESS (per scheduling cycle) ----
+
+Scheduler.schedule()                            [vllm/vllm/v1/core/sched/scheduler.py:348]
+  └─ (for each new waiting request)
+       └─ connector.get_num_new_matched_tokens(request, num_local_computed_tokens)
+            │  [vllm-ascend/…/ascend_store_connector.py:114]
+            └─ KVPoolScheduler.get_num_new_matched_tokens(request, num_computed_tokens)
+                 │  [vllm-ascend/…/pool_scheduler.py:56]
+                 └─ self.client.lookup(token_len, request.block_hashes)
+                      │  [vllm-ascend/…/pool_scheduler.py:355]  ← LookupKeyClient.lookup()
+                      └─ zmq.REQ.send_multipart([token_len_bytes] + hash_frames)
+                           │  (blocks on network call over the IPC socket)
+                           │
+                           │  ~~~ ZMQ IPC channel (path contains lookup_rpc_port) ~~~
+                           │
+                           ▼
+# ---- WORKER PROCESS (background thread, rank 0) ----
+
+LookupKeyServer.process_request()   [background daemon thread]
+  │  [vllm-ascend/…/ascend_store_connector.py:250]
+  └─ zmq.REP.recv_multipart()
+       └─ pool_worker.lookup_scheduler(token_len, hashes_str, use_layerwise)
+            │  [vllm-ascend/…/pool_worker.py:577]
+            └─ token_database.process_tokens(token_len, block_hashes)
+                 │  → generates block keys
+            └─ m_store.exists(keys)           ← queries backend (Mooncake/Memcache/Yuanrong)
+            └─ returns: num_hit_tokens (int)
+       └─ zmq.REP.send(result.to_bytes(4, "big"))
+
+# ---- back in SCHEDULER PROCESS ----
+
+LookupKeyClient.lookup() ← zmq.REQ.recv() returns num_hit_tokens
+  └─ KVPoolScheduler.get_num_new_matched_tokens()
+       └─ computes need_to_allocate = num_hit_tokens - num_local_computed_tokens
+            └─ returns (need_to_allocate, load_async)
+                 └─ Scheduler.schedule() uses this to decide block allocation
+```
+
+---
+
+### 4.3 Complete function list in call order
+
+| Step | Process | Function | File |
+|------|---------|----------|------|
+| 1 | Both | `AscendStoreConnector.__init__` | `ascend_store_connector.py` |
+| 2 | Worker rank 0 | `LookupKeyServer.__init__` | `ascend_store_connector.py` |
+| 3 | Both | `get_zmq_rpc_path_lookup` | `pool_scheduler.py` |
+| 4 | Worker rank 0 | `make_zmq_socket` (bind, REP) | vllm `network_utils` |
+| 5 | Scheduler | `KVPoolScheduler.__init__` → `LookupKeyClient.__init__` | `pool_scheduler.py` |
+| 6 | Scheduler | `make_zmq_socket` (connect, REQ) | vllm `network_utils` |
+| 7 | Scheduler | `Scheduler.schedule` | vllm `scheduler.py` |
+| 8 | Scheduler | `AscendStoreConnector.get_num_new_matched_tokens` | `ascend_store_connector.py` |
+| 9 | Scheduler | `KVPoolScheduler.get_num_new_matched_tokens` | `pool_scheduler.py` |
+| 10 | Scheduler | `LookupKeyClient.lookup` | `pool_scheduler.py` |
+| 11 | Worker (thread) | `LookupKeyServer.process_request` (loop) | `ascend_store_connector.py` |
+| 12 | Worker (thread) | `KVPoolWorker.lookup_scheduler` | `pool_worker.py` |
+| 13 | Worker (thread) | `KVPoolWorker.token_database.process_tokens` + `m_store.exists` | `pool_worker.py` |
+
+---
+
+## 5) Why this key exists — history from upstream issues/PRs
 
 ### Primary design evolution
 
