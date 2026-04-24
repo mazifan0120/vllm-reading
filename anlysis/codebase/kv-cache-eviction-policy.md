@@ -95,7 +95,32 @@ A **cached** block (one with a block hash, `ref_cnt == 0`, sitting in the free q
 
 **Which blocks?** Any prefix-cached block that has not been accessed recently enough — specifically, the least recently freed blocks, and among those at the same recency level, the ones with the longest token chains (tails of request sequences).
 
-### 3.2 Running-request preemption (scheduler-driven eviction)
+### 3.2 Eviction without memory pressure
+
+**Yes — prefix-cache eviction happens even when HBM is not full and no request preemption has occurred.**
+
+The root cause is that `free_block_queue` is a **single, unified LRU queue** that holds *all* free blocks — both clean blocks (no hash) and prefix-cached blocks (has a hash) — in the same data structure. There is no separate "clean pool" to draw from first.
+
+```python
+# BlockPool.get_new_blocks()
+ret = self.free_block_queue.popleft_n(num_blocks)   # pops N LRU-front blocks — no filter on hash status
+
+if self.enable_caching:
+    for block in ret:
+        self._maybe_evict_cached_block(block)        # ← evicts prefix-cache entry if the block had a hash
+        block.ref_cnt += 1
+```
+
+**Concrete example:** Suppose the pool has 1 000 blocks and 800 are currently free (system is well under memory pressure). Those 800 blocks sit in the LRU queue; the oldest-freed ones are at the front and almost certainly carry a `block_hash` from previously-served requests that were cached for prefix reuse. When a new request asks for 10 blocks, `get_new_blocks(10)` unconditionally pops the 10 LRU-front blocks. For each one that has a hash, `_maybe_evict_cached_block` removes its entry from `cached_block_hash_to_block` and clears the hash — **10 prefix-cache entries are invalidated even though 790 free blocks remain**.
+
+There is deliberately no "try clean blocks first" path. This is by design:
+
+- **LRU ordering already encodes value**: a block at the LRU front was freed long ago, so its prefix is statistically least likely to be reused. Evicting it first is the right choice regardless of overall pressure.
+- **`touch()` is the only protection**: if a new request *does* match a cached block's prefix, `get_computed_blocks()` calls `BlockPool.touch()` *before* `get_new_blocks()`. `touch` removes the block from the free queue (promoting it to active, `ref_cnt ≥ 1`), so it cannot be popped. Without a cache hit, the block remains in the queue and will be evicted on the next allocation that reaches it.
+
+In short, **eviction is a side-effect of allocation, not of memory pressure**. Memory-pressure preemption (§3.3) is a separate, higher-level mechanism that only triggers when the free-block count is insufficient to schedule the next request at all.
+
+### 3.3 Running-request preemption (scheduler-driven eviction)
 
 When `allocate_slots` in `SingleTypeKVCacheManager` cannot obtain enough free blocks, the scheduler is returned `None` and must preempt a running request:
 
@@ -113,7 +138,7 @@ self.waiting.prepend_request(request)  # moved to front of the waiting queue
 - FCFS (default): `self.running.pop()` — the request that was **most recently added** to the running queue is preempted first.
 - Priority scheduling: `max(self.running, key=lambda r: (r.priority, r.arrival_time))` — the request with the numerically **highest priority value** (lowest business priority) and earliest arrival time is preempted first.
 
-After preemption, the freed blocks may still retain their cached status in `cached_block_hash_to_block` until they are reallocated (at which point eviction happens as in §3.1). This means a newly preempted request's prefix blocks might survive in the LRU cache and serve a cache hit if the request is rescheduled quickly.
+After preemption, the freed blocks may still retain their cached status in `cached_block_hash_to_block` until they are reallocated (at which point eviction happens as in §3.1 and §3.2). This means a newly preempted request's prefix blocks might survive in the LRU cache and serve a cache hit if the request is rescheduled quickly.
 
 ---
 
